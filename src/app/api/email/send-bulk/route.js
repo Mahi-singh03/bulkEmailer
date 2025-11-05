@@ -35,11 +35,28 @@ export async function POST(req) {
     const worksheet = workbook.Sheets[sheetName];
     const emailData = XLSX.utils.sheet_to_json(worksheet);
 
-    // Extract emails from Excel
-    const emailList = emailData.map(row => ({
-      email: row.email || row.Email || row.EMAIL,
-      name: row.name || row.Name || row.NAME || '',
-    })).filter(item => item.email);
+    // Email validation helper
+    const isValidEmail = (email) => {
+      if (!email || typeof email !== 'string') return false;
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      return emailRegex.test(email.trim());
+    };
+
+    // Extract emails from Excel and validate
+    const emailList = emailData
+      .map(row => {
+        const email = (row.email || row.Email || row.EMAIL || '').trim();
+        const name = (row.name || row.Name || row.NAME || '').trim();
+        return { email, name };
+      })
+      .filter(item => {
+        if (!item.email) return false;
+        if (!isValidEmail(item.email)) {
+          console.warn(`Invalid email format detected: ${item.email}`);
+          return false; // Filter out invalid emails
+        }
+        return true;
+      });
 
     if (emailList.length === 0) {
       return NextResponse.json({ message: 'No valid emails found in the file' }, { status: 400 });
@@ -72,33 +89,87 @@ export async function POST(req) {
     );
 
     if (result.success) {
-      // Update user credits
-      await User.findByIdAndUpdate(user._id, {
-        $inc: {
-          freeCredits: -result.sent,
-          usedCredits: result.sent,
-        },
+      // Update individual email statuses in the campaign
+      const emailResults = result.emailResults || [];
+      const updatedEmailList = campaign.emailList.map((emailItem) => {
+        // Convert Mongoose document to plain object if needed
+        const emailObj = emailItem.toObject ? emailItem.toObject() : emailItem;
+        const emailResult = emailResults.find(
+          (r) => r.email === emailObj.email
+        );
+        
+        if (emailResult) {
+          return {
+            email: emailObj.email,
+            name: emailObj.name || '',
+            status: emailResult.success ? 'sent' : 'failed',
+          };
+        }
+        return {
+          email: emailObj.email,
+          name: emailObj.name || '',
+          status: emailObj.status || 'pending',
+        };
       });
 
-      // Update campaign status
+      // Update user credits - only deduct for successfully sent emails
+      // Verify the count matches
+      const actualSentCount = result.sent || 0;
+      
+      if (actualSentCount > 0) {
+        await User.findByIdAndUpdate(user._id, {
+          $inc: {
+            freeCredits: -actualSentCount,
+            usedCredits: actualSentCount,
+          },
+        });
+      }
+
+      // Update campaign with individual email statuses and final counts
       await EmailCampaign.findByIdAndUpdate(campaign._id, {
-        sentCount: result.sent,
-        status: 'completed',
+        emailList: updatedEmailList,
+        sentCount: actualSentCount,
+        status: actualSentCount > 0 ? 'completed' : 'failed',
       });
+
+      // Verify counts are accurate
+      const totalExpected = emailList.length;
+      const totalSent = actualSentCount;
+      const totalFailed = result.failed || 0;
+      const totalProcessed = totalSent + totalFailed;
+
+      if (totalProcessed !== totalExpected) {
+        console.error(`Count mismatch: Expected ${totalExpected}, got sent: ${totalSent}, failed: ${totalFailed}`);
+      }
 
       return NextResponse.json({
-        message: `Successfully sent ${result.sent} emails. ${result.failed} failed.`,
-        sent: result.sent,
-        failed: result.failed,
+        message: `Successfully sent ${totalSent} emails. ${totalFailed} failed.`,
+        sent: totalSent,
+        failed: totalFailed,
+        total: totalExpected,
       });
     } else {
+      // All emails failed
+      const updatedEmailList = campaign.emailList.map((emailItem) => {
+        const emailObj = emailItem.toObject ? emailItem.toObject() : emailItem;
+        return {
+          email: emailObj.email,
+          name: emailObj.name || '',
+          status: 'failed',
+        };
+      });
+
       await EmailCampaign.findByIdAndUpdate(campaign._id, {
+        emailList: updatedEmailList,
         status: 'failed',
+        sentCount: 0,
       });
 
       return NextResponse.json({ 
         message: 'Failed to send emails', 
-        error: result.error 
+        error: result.error,
+        sent: 0,
+        failed: emailList.length,
       }, { status: 500 });
     }
 
